@@ -29,7 +29,31 @@ A bridge to interact with LM Arena. This project provides an OpenAI compatible A
 
 ### 1. Get your Authentication Token
 
-To use the LM Arena Bridge, you need to get your authentication token from the LM Arena website.
+#### 🎉 New: Auto Cookie Grabber (Recommended)
+
+The easiest way to get your authentication token is using the **Auto Cookie Grabber** feature:
+
+1.  **Run the Application:**
+    ```bash
+    python src/main.py
+    ```
+
+2.  **Access the Dashboard:**
+    Open your browser and go to `http://localhost:8000/dashboard`
+
+3.  **Login:**
+    Use your dashboard password (default: `admin`)
+
+4.  **Auto-Grab Cookies:**
+    - Scroll to the "Arena Authentication Tokens" section
+    - Click the "🚀 Auto Grab Cookies from Browser" button
+    - The system will automatically detect and save your `arena-auth-prod-v1` token if you're logged in to lmarena.ai
+
+**That's it!** The token is automatically saved to your configuration.
+
+#### Manual Method (Alternative)
+
+If the auto-grabber doesn't work, you can still manually get your token:
 
 1.  Open your web browser and go to the LM Arena website.
 2.  Send a message in the chat to any model.
@@ -37,21 +61,9 @@ To use the LM Arena Bridge, you need to get your authentication token from the L
 4.  Go to the "Application" or "Storage" tab (the name may vary depending on your browser).
 5.  In the "Cookies" section, find the cookies for the LM Arena site.
 6.  Look for a cookie named `arena-auth-prod-v1` and copy its value. This is your authentication token. THIS IS THE TOKEN STARTING WITH base64-
+7.  Go to the dashboard and paste the token in the "Manual Add Token" section.
 
-### 2. Configure the Application
-
-1.  In the root of the project, create a file named `config.json`.
-2.  Add the following content to the `config.json` file:
-
-    ```json
-    {
-      "auth_token": "YOUR_AUTH_TOKEN"
-    }
-    ```
-
-3.  Replace `"YOUR_AUTH_TOKEN"` with the `arena-auth-prod-v1` token you copied from your browser.
-
-### 3. Run the Application
+### 2. Run the Application
 
 Once you have configured your authentication token, you can run the application:
 

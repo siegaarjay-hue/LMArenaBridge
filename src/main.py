@@ -713,17 +713,37 @@ async def get_initial_data():
             # Give it time to capture all JS responses
             await asyncio.sleep(5)
 
-            # Extract cf_clearance
+            # Extract cf_clearance and arena-auth-prod-v1
             cookies = await page.context.cookies()
             cf_clearance_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
+            arena_auth_cookie = next((c for c in cookies if c["name"] == "arena-auth-prod-v1"), None)
             
             config = get_config()
+            
+            # Save cf_clearance
             if cf_clearance_cookie:
                 config["cf_clearance"] = cf_clearance_cookie["value"]
-                save_config(config)
                 debug_print(f"✅ Saved cf_clearance token: {cf_clearance_cookie['value'][:20]}...")
             else:
                 debug_print("⚠️ Could not find cf_clearance cookie.")
+            
+            # Auto-grab arena-auth-prod-v1 cookie if available
+            if arena_auth_cookie:
+                auth_token = arena_auth_cookie["value"]
+                # Check if token already exists
+                if "auth_tokens" not in config:
+                    config["auth_tokens"] = []
+                
+                if auth_token not in config["auth_tokens"]:
+                    config["auth_tokens"].append(auth_token)
+                    debug_print(f"✅ Auto-grabbed arena-auth-prod-v1 token: {auth_token[:20]}...")
+                    debug_print(f"   Added to auth_tokens list (total: {len(config['auth_tokens'])})")
+                else:
+                    debug_print(f"ℹ️  arena-auth-prod-v1 token already exists in config")
+            else:
+                debug_print("ℹ️  No arena-auth-prod-v1 cookie found (user not logged in)")
+            
+            save_config(config)
 
             # Extract models
             debug_print("Extracting models from page...")
@@ -816,6 +836,158 @@ async def get_initial_data():
             debug_print("✅ Initial data retrieval complete")
     except Exception as e:
         debug_print(f"❌ An error occurred during initial data retrieval: {e}")
+
+async def auto_grab_auth_cookies_with_login(google_email: str = None, google_password: str = None):
+    """
+    Auto-grab arena-auth-prod-v1 cookies by logging in to LMArena
+    Supports Google OAuth login if credentials are provided
+    
+    Args:
+        google_email: Optional Google account email for login
+        google_password: Optional Google account password for login
+    
+    Returns:
+        dict with success status and message
+    """
+    debug_print("\n" + "="*60)
+    debug_print("🔐 Starting auto cookie grabber with login...")
+    debug_print("="*60)
+    
+    try:
+        async with AsyncCamoufox(headless=True) as browser:  # Use headless mode for cookie grabbing
+            page = await browser.new_page()
+            
+            debug_print("📍 Navigating to lmarena.ai...")
+            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            
+            # Wait for Cloudflare
+            debug_print("☁️  Waiting for Cloudflare challenge...")
+            try:
+                await page.wait_for_function(
+                    "() => document.title.indexOf('Just a moment...') === -1", 
+                    timeout=45000
+                )
+                debug_print("✅ Cloudflare challenge passed")
+            except Exception as e:
+                debug_print(f"⚠️  Cloudflare challenge issue: {e}")
+            
+            await asyncio.sleep(3)
+            
+            # Check if already logged in
+            cookies = await page.context.cookies()
+            arena_auth_cookie = next((c for c in cookies if c["name"] == "arena-auth-prod-v1"), None)
+            
+            if arena_auth_cookie:
+                debug_print("✅ Already logged in! Found arena-auth-prod-v1 cookie")
+                auth_token = arena_auth_cookie["value"]
+                
+                config = get_config()
+                if "auth_tokens" not in config:
+                    config["auth_tokens"] = []
+                
+                if auth_token not in config["auth_tokens"]:
+                    config["auth_tokens"].append(auth_token)
+                    save_config(config)
+                    debug_print(f"✅ Added auth token: {auth_token[:30]}...")
+                    return {
+                        "success": True,
+                        "message": f"Successfully grabbed auth token! Total tokens: {len(config['auth_tokens'])}"
+                    }
+                else:
+                    debug_print("ℹ️  Token already exists in config")
+                    return {
+                        "success": True,
+                        "message": "Auth token already exists in configuration"
+                    }
+            
+            # If not logged in and credentials provided, attempt login
+            if google_email and google_password:
+                debug_print("🔑 Attempting Google OAuth login...")
+                
+                # Look for login button
+                try:
+                    # Wait for and click sign in button
+                    await page.wait_for_selector('button:has-text("Sign in")', timeout=10000)
+                    await page.click('button:has-text("Sign in")')
+                    debug_print("✅ Clicked sign in button")
+                    await asyncio.sleep(2)
+                    
+                    # Look for Google sign in option
+                    await page.wait_for_selector('button:has-text("Google")', timeout=10000)
+                    await page.click('button:has-text("Google")')
+                    debug_print("✅ Clicked Google sign in")
+                    await asyncio.sleep(3)
+                    
+                    # Handle Google login in popup/new page
+                    # Wait for Google login page
+                    await page.wait_for_selector('input[type="email"]', timeout=15000)
+                    await page.fill('input[type="email"]', google_email)
+                    await page.click('button:has-text("Next")')
+                    debug_print("✅ Entered email")
+                    await asyncio.sleep(2)
+                    
+                    # Enter password
+                    await page.wait_for_selector('input[type="password"]', timeout=10000)
+                    await page.fill('input[type="password"]', google_password)
+                    await page.click('button:has-text("Next")')
+                    debug_print("✅ Entered password")
+                    await asyncio.sleep(5)
+                    
+                    # Wait for redirect back to LMArena
+                    await page.wait_for_url("**/lmarena.ai/**", timeout=30000)
+                    debug_print("✅ Redirected back to LMArena")
+                    await asyncio.sleep(3)
+                    
+                    # Check for auth cookie again
+                    cookies = await page.context.cookies()
+                    arena_auth_cookie = next((c for c in cookies if c["name"] == "arena-auth-prod-v1"), None)
+                    
+                    if arena_auth_cookie:
+                        auth_token = arena_auth_cookie["value"]
+                        config = get_config()
+                        if "auth_tokens" not in config:
+                            config["auth_tokens"] = []
+                        
+                        if auth_token not in config["auth_tokens"]:
+                            config["auth_tokens"].append(auth_token)
+                            save_config(config)
+                            debug_print(f"✅ Successfully grabbed auth token after login: {auth_token[:30]}...")
+                            return {
+                                "success": True,
+                                "message": f"Successfully logged in and grabbed auth token! Total tokens: {len(config['auth_tokens'])}"
+                            }
+                    else:
+                        debug_print("❌ Login succeeded but no auth cookie found")
+                        return {
+                            "success": False,
+                            "message": "Login completed but auth cookie not found. Please try again."
+                        }
+                        
+                except Exception as login_error:
+                    debug_print(f"❌ Login failed: {login_error}")
+                    return {
+                        "success": False,
+                        "message": f"Login failed: {str(login_error)}"
+                    }
+            else:
+                # No login credentials and not logged in
+                debug_print("ℹ️  Not logged in and no credentials provided")
+                debug_print("💡 Please log in to lmarena.ai in your browser, then use 'Refresh Tokens' button")
+                return {
+                    "success": False,
+                    "message": "Not logged in. Please provide Google credentials or log in manually to lmarena.ai in your browser, then click 'Auto Grab Cookies' button."
+                }
+                
+    except Exception as e:
+        debug_print(f"❌ Error in auto cookie grabber: {e}")
+        import traceback
+        debug_print(traceback.format_exc())
+        return {
+            "success": False,
+            "message": f"Error: {str(e)}"
+        }
+    finally:
+        debug_print("="*60 + "\n")
 
 async def periodic_refresh_task():
     """Background task to refresh cf_clearance and models every 30 minutes"""
@@ -1385,15 +1557,31 @@ async def dashboard(session: str = Depends(get_current_session)):
                     </div>
                     ''' for i, token in enumerate(config.get("auth_tokens", []))])}
                     
-                    {('<div class="no-data">No tokens configured. Add tokens below.</div>' if not config.get("auth_tokens") else '')}
+                    {('<div class="no-data">No tokens configured. Add tokens below or use Auto Grab.</div>' if not config.get("auth_tokens") else '')}
                     
-                    <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">Add New Token</h3>
+                    <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">Auto Grab Cookies (Recommended)</h3>
+                    <p style="color: #666; margin-bottom: 15px;">
+                        🎉 <strong>New Feature!</strong> Automatically grab your auth tokens without manual cookie copying.
+                        <br/>
+                        <strong>How it works:</strong> Opens lmarena.ai in a browser to capture cookies. If you're already logged in, it grabs your token instantly!
+                    </p>
+                    <form action="/auto-grab-cookies" method="post" style="margin-bottom: 25px;">
+                        <button type="submit" style="background: linear-gradient(135deg, #28a745 0%, #20c997 100%); width: 100%;">
+                            🚀 Auto Grab Cookies from Browser
+                        </button>
+                    </form>
+                    <p style="color: #999; font-size: 13px; margin-bottom: 25px;">
+                        <em>Note: Make sure you're logged in to lmarena.ai in your default browser. The system will automatically detect and save your auth token.</em>
+                    </p>
+                    
+                    <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">Manual Add Token (Alternative)</h3>
+                    <p style="color: #666; margin-bottom: 15px;">If auto-grab doesn't work, you can manually paste your token:</p>
                     <form action="/add-auth-token" method="post">
                         <div class="form-group">
                             <label for="new_auth_token">New Arena Auth Token</label>
                             <textarea id="new_auth_token" name="new_auth_token" placeholder="Paste a new arena-auth-prod-v1 token here" required></textarea>
                         </div>
-                        <button type="submit">Add Token</button>
+                        <button type="submit">Add Token Manually</button>
                     </form>
                 </div>
 
@@ -1683,6 +1871,18 @@ async def refresh_tokens(session: str = Depends(get_current_session)):
         await get_initial_data()
     except Exception as e:
         debug_print(f"❌ Error refreshing tokens: {e}")
+    return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/auto-grab-cookies")
+async def auto_grab_cookies(session: str = Depends(get_current_session)):
+    """Auto-grab arena-auth-prod-v1 cookies from browser session"""
+    if not session:
+        return RedirectResponse(url="/login")
+    try:
+        result = await auto_grab_auth_cookies_with_login()
+        debug_print(f"Auto-grab result: {result}")
+    except Exception as e:
+        debug_print(f"❌ Error auto-grabbing cookies: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
 
 # --- OpenAI Compatible API Endpoints ---
