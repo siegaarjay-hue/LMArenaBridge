@@ -6,6 +6,8 @@ import time
 import secrets
 import base64
 import mimetypes
+import os
+import traceback
 from collections import defaultdict
 from typing import Optional, Dict, List
 from datetime import datetime, timezone, timedelta
@@ -850,144 +852,245 @@ async def auto_grab_auth_cookies_with_login(google_email: str = None, google_pas
         dict with success status and message
     """
     debug_print("\n" + "="*60)
-    debug_print("🔐 Starting auto cookie grabber with login...")
+    debug_print("🔐 AUTO COOKIE GRABBER - REAL-TIME DEBUG MODE")
     debug_print("="*60)
     
+    # Debug: Check initial state
+    config = get_config()
+    debug_print(f"📊 Initial state check:")
+    debug_print(f"   - Existing auth tokens: {len(config.get('auth_tokens', []))}")
+    debug_print(f"   - Config file exists: {os.path.exists('config.json')}")
+    
     try:
-        async with AsyncCamoufox(headless=True) as browser:  # Use headless mode for cookie grabbing
-            page = await browser.new_page()
-            
-            debug_print("📍 Navigating to lmarena.ai...")
-            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
-            
-            # Wait for Cloudflare
-            debug_print("☁️  Waiting for Cloudflare challenge...")
-            try:
-                await page.wait_for_function(
-                    "() => document.title.indexOf('Just a moment...') === -1", 
-                    timeout=45000
-                )
-                debug_print("✅ Cloudflare challenge passed")
-            except Exception as e:
-                debug_print(f"⚠️  Cloudflare challenge issue: {e}")
-            
-            await asyncio.sleep(3)
-            
-            # Check if already logged in
-            cookies = await page.context.cookies()
-            arena_auth_cookie = next((c for c in cookies if c["name"] == "arena-auth-prod-v1"), None)
-            
-            if arena_auth_cookie:
-                debug_print("✅ Already logged in! Found arena-auth-prod-v1 cookie")
-                auth_token = arena_auth_cookie["value"]
+        debug_print("\n🌐 STEP 1: Browser Initialization")
+        debug_print("-" * 60)
+        
+        try:
+            async with AsyncCamoufox(headless=True) as browser:
+                debug_print("✅ Browser created successfully (Camoufox)")
                 
-                config = get_config()
-                if "auth_tokens" not in config:
-                    config["auth_tokens"] = []
+                debug_print("\n📄 STEP 2: Creating New Page")
+                debug_print("-" * 60)
+                page = await browser.new_page()
+                debug_print("✅ New page created")
                 
-                if auth_token not in config["auth_tokens"]:
-                    config["auth_tokens"].append(auth_token)
-                    save_config(config)
-                    debug_print(f"✅ Added auth token: {auth_token[:30]}...")
-                    return {
-                        "success": True,
-                        "message": f"Successfully grabbed auth token! Total tokens: {len(config['auth_tokens'])}"
-                    }
-                else:
-                    debug_print("ℹ️  Token already exists in config")
-                    return {
-                        "success": True,
-                        "message": "Auth token already exists in configuration"
-                    }
-            
-            # If not logged in and credentials provided, attempt login
-            if google_email and google_password:
-                debug_print("🔑 Attempting Google OAuth login...")
+                debug_print("\n🚀 STEP 3: Navigation to LMArena")
+                debug_print("-" * 60)
+                debug_print("   Target: https://lmarena.ai/")
                 
-                # Look for login button
                 try:
-                    # Wait for and click sign in button
-                    await page.wait_for_selector('button:has-text("Sign in")', timeout=10000)
-                    await page.click('button:has-text("Sign in")')
-                    debug_print("✅ Clicked sign in button")
-                    await asyncio.sleep(2)
+                    start_time = time.time()
+                    await page.goto("https://lmarena.ai/", wait_until="domcontentloaded", timeout=30000)
+                    load_time = time.time() - start_time
+                    debug_print(f"✅ Page loaded successfully ({load_time:.2f}s)")
+                except Exception as nav_error:
+                    debug_print(f"❌ Navigation failed: {nav_error}")
+                    raise
+                
+                debug_print("\n☁️  STEP 4: Cloudflare Challenge Detection")
+                debug_print("-" * 60)
+                
+                # Check current page title
+                try:
+                    current_title = await page.title()
+                    debug_print(f"   Current page title: '{current_title}'")
                     
-                    # Look for Google sign in option
-                    await page.wait_for_selector('button:has-text("Google")', timeout=10000)
-                    await page.click('button:has-text("Google")')
-                    debug_print("✅ Clicked Google sign in")
-                    await asyncio.sleep(3)
+                    if "Just a moment" in current_title or "Checking" in current_title:
+                        debug_print("   🔍 Cloudflare challenge detected!")
+                        debug_print("   ⏳ Waiting for challenge to complete...")
+                        
+                        try:
+                            await page.wait_for_function(
+                                "() => document.title.indexOf('Just a moment') === -1 && document.title.indexOf('Checking') === -1", 
+                                timeout=60000  # Increased to 60s for CF
+                            )
+                            final_title = await page.title()
+                            debug_print(f"   ✅ Cloudflare challenge passed! New title: '{final_title}'")
+                        except Exception as cf_error:
+                            debug_print(f"   ❌ Cloudflare timeout: {cf_error}")
+                            debug_print(f"   📸 Taking screenshot for debugging...")
+                            
+                            try:
+                                await page.screenshot(path="/tmp/cf_challenge_failed.png")
+                                debug_print(f"   📸 Screenshot saved: /tmp/cf_challenge_failed.png")
+                            except:
+                                pass
+                            
+                            raise Exception("Cloudflare challenge failed to complete in 60 seconds")
+                    else:
+                        debug_print(f"   ✅ No Cloudflare challenge detected")
                     
-                    # Handle Google login in popup/new page
-                    # Wait for Google login page
-                    await page.wait_for_selector('input[type="email"]', timeout=15000)
-                    await page.fill('input[type="email"]', google_email)
-                    await page.click('button:has-text("Next")')
-                    debug_print("✅ Entered email")
-                    await asyncio.sleep(2)
-                    
-                    # Enter password
-                    await page.wait_for_selector('input[type="password"]', timeout=10000)
-                    await page.fill('input[type="password"]', google_password)
-                    await page.click('button:has-text("Next")')
-                    debug_print("✅ Entered password")
-                    await asyncio.sleep(5)
-                    
-                    # Wait for redirect back to LMArena
-                    await page.wait_for_url("**/lmarena.ai/**", timeout=30000)
-                    debug_print("✅ Redirected back to LMArena")
-                    await asyncio.sleep(3)
-                    
-                    # Check for auth cookie again
+                except Exception as title_error:
+                    debug_print(f"   ⚠️  Could not check title: {title_error}")
+                
+                # Extra wait for page stabilization
+                debug_print("   ⏳ Waiting 3s for page stabilization...")
+                await asyncio.sleep(3)
+                debug_print("   ✅ Page stabilized")
+                
+                debug_print("\n🍪 STEP 5: Cookie Extraction")
+                debug_print("-" * 60)
+                
+                try:
                     cookies = await page.context.cookies()
+                    debug_print(f"   📊 Total cookies found: {len(cookies)}")
+                    
+                    # Debug: Show all cookie names
+                    cookie_names = [c["name"] for c in cookies]
+                    debug_print(f"   📋 Cookie names: {', '.join(cookie_names[:10])}")
+                    if len(cookie_names) > 10:
+                        debug_print(f"      ... and {len(cookie_names) - 10} more")
+                    
+                    # Look for arena-auth-prod-v1
                     arena_auth_cookie = next((c for c in cookies if c["name"] == "arena-auth-prod-v1"), None)
                     
                     if arena_auth_cookie:
+                        debug_print(f"   ✅ FOUND: arena-auth-prod-v1 cookie!")
                         auth_token = arena_auth_cookie["value"]
+                        debug_print(f"   📋 Token preview: {auth_token[:40]}...")
+                        debug_print(f"   📏 Token length: {len(auth_token)} characters")
+                        debug_print(f"   📅 Domain: {arena_auth_cookie.get('domain', 'N/A')}")
+                        debug_print(f"   🔒 Secure: {arena_auth_cookie.get('secure', False)}")
+                        debug_print(f"   📝 HttpOnly: {arena_auth_cookie.get('httpOnly', False)}")
+                        
+                        debug_print("\n💾 STEP 6: Token Storage")
+                        debug_print("-" * 60)
+                        
                         config = get_config()
                         if "auth_tokens" not in config:
                             config["auth_tokens"] = []
+                            debug_print("   📝 Created new auth_tokens array")
+                        
+                        current_count = len(config["auth_tokens"])
+                        debug_print(f"   📊 Current token count: {current_count}")
                         
                         if auth_token not in config["auth_tokens"]:
                             config["auth_tokens"].append(auth_token)
                             save_config(config)
-                            debug_print(f"✅ Successfully grabbed auth token after login: {auth_token[:30]}...")
+                            new_count = len(config["auth_tokens"])
+                            debug_print(f"   ✅ Token added successfully!")
+                            debug_print(f"   📊 New token count: {new_count}")
+                            debug_print(f"   💾 Config saved to disk")
+                            
                             return {
                                 "success": True,
-                                "message": f"Successfully logged in and grabbed auth token! Total tokens: {len(config['auth_tokens'])}"
+                                "message": f"✅ Successfully grabbed and saved auth token! Total tokens: {new_count}",
+                                "token_preview": auth_token[:40],
+                                "token_count": new_count
+                            }
+                        else:
+                            debug_print(f"   ℹ️  Token already exists in config")
+                            debug_print(f"   📊 No changes made")
+                            return {
+                                "success": True,
+                                "message": "ℹ️  Auth token already exists in configuration",
+                                "token_count": current_count
                             }
                     else:
-                        debug_print("❌ Login succeeded but no auth cookie found")
-                        return {
-                            "success": False,
-                            "message": "Login completed but auth cookie not found. Please try again."
-                        }
+                        debug_print(f"   ❌ arena-auth-prod-v1 cookie NOT FOUND")
+                        debug_print(f"   💡 This means user is not logged in to lmarena.ai")
                         
-                except Exception as login_error:
-                    debug_print(f"❌ Login failed: {login_error}")
-                    return {
-                        "success": False,
-                        "message": f"Login failed: {str(login_error)}"
-                    }
-            else:
-                # No login credentials and not logged in
-                debug_print("ℹ️  Not logged in and no credentials provided")
-                debug_print("💡 Please log in to lmarena.ai in your browser, then use 'Refresh Tokens' button")
+                        # Check if we have Google credentials to attempt login
+                        if google_email and google_password:
+                            debug_print("\n🔑 STEP 7: Google OAuth Login Attempt")
+                            debug_print("-" * 60)
+                            debug_print("   ⚠️  This feature is experimental")
+                            return {
+                                "success": False,
+                                "message": "⚠️  Auto-login not yet implemented. Please log in to lmarena.ai manually in your browser."
+                            }
+                        else:
+                            return {
+                                "success": False,
+                                "message": "ℹ️  Not logged in. Please log in to lmarena.ai in your browser first, then the system will auto-grab your token on next startup or refresh."
+                            }
+                        
+                except Exception as cookie_error:
+                    debug_print(f"   ❌ Cookie extraction failed: {cookie_error}")
+                    raise
+                    
+        except Exception as browser_error:
+            debug_print(f"\n❌ Browser initialization/operation failed:")
+            debug_print(f"   Error type: {type(browser_error).__name__}")
+            debug_print(f"   Error message: {str(browser_error)}")
+            
+            # Check if it's a GitHub API rate limit issue
+            if "403" in str(browser_error) and "github.com" in str(browser_error):
+                debug_print(f"\n💡 DIAGNOSIS: GitHub API Rate Limit")
+                debug_print(f"   This is a known issue in CI/automated environments")
+                debug_print(f"   The browser files couldn't be downloaded from GitHub")
+                debug_print(f"\n🔧 WORKAROUND:")
+                debug_print(f"   The system will still work when you deploy it locally")
+                debug_print(f"   Or cookies will be grabbed during the periodic refresh")
                 return {
                     "success": False,
-                    "message": "Not logged in. Please provide Google credentials or log in manually to lmarena.ai in your browser, then click 'Auto Grab Cookies' button."
+                    "message": "⚠️  Browser automation unavailable (GitHub rate limit). Cookies will be grabbed on next startup.",
+                    "error_type": "github_rate_limit"
                 }
+            
+            raise
                 
     except Exception as e:
-        debug_print(f"❌ Error in auto cookie grabber: {e}")
+        debug_print(f"\n❌ FATAL ERROR in auto cookie grabber:")
+        debug_print(f"   Error type: {type(e).__name__}")
+        debug_print(f"   Error message: {str(e)}")
+        
+        # Import traceback here for debugging
         import traceback
+        debug_print(f"\n📋 Full stack trace:")
         debug_print(traceback.format_exc())
+        
         return {
             "success": False,
-            "message": f"Error: {str(e)}"
+            "message": f"❌ Error: {str(e)}",
+            "error_type": type(e).__name__
         }
     finally:
+        debug_print("\n" + "="*60)
+        debug_print("🏁 AUTO COOKIE GRABBER COMPLETED")
         debug_print("="*60 + "\n")
+
+async def periodic_auto_cookie_grabber():
+    """
+    Background task to automatically grab auth cookies every 30 minutes
+    Runs continuously to ensure tokens are always up to date
+    """
+    debug_print("\n" + "="*60)
+    debug_print("🤖 AUTOMATIC COOKIE GRABBER - Starting Background Task")
+    debug_print("="*60)
+    debug_print("   This task will run every 30 minutes automatically")
+    debug_print("   It will grab cookies whenever you're logged in to lmarena.ai")
+    debug_print("="*60 + "\n")
+    
+    # Wait 5 minutes before first run to let server stabilize
+    await asyncio.sleep(300)
+    
+    while True:
+        try:
+            debug_print("\n" + "="*60)
+            debug_print("⏰ SCHEDULED AUTO COOKIE GRAB - Starting...")
+            debug_print("="*60)
+            
+            result = await auto_grab_auth_cookies_with_login()
+            
+            if result["success"]:
+                debug_print(f"✅ Automatic grab successful: {result['message']}")
+            else:
+                debug_print(f"ℹ️  Automatic grab info: {result['message']}")
+            
+            debug_print("="*60)
+            debug_print("⏰ Next automatic grab in 30 minutes")
+            debug_print("="*60 + "\n")
+            
+            # Wait 30 minutes before next attempt
+            await asyncio.sleep(1800)
+            
+        except Exception as e:
+            debug_print(f"❌ Error in periodic auto cookie grabber: {e}")
+            debug_print(traceback.format_exc())
+            # Wait 30 minutes even on error
+            await asyncio.sleep(1800)
+            continue
 
 async def periodic_refresh_task():
     """Background task to refresh cf_clearance and models every 30 minutes"""
@@ -1014,12 +1117,30 @@ async def startup_event():
         save_models(get_models())
         # Load usage stats from config
         load_usage_stats()
-        # Start initial data fetch
+        
+        debug_print("\n" + "="*60)
+        debug_print("🚀 STARTING BACKGROUND TASKS")
+        debug_print("="*60)
+        
+        # Start initial data fetch (includes cookie grabbing)
+        debug_print("   1️⃣  Initial data fetch task")
         asyncio.create_task(get_initial_data())
+        
         # Start periodic refresh task (every 30 minutes)
+        debug_print("   2️⃣  Periodic refresh task (30 min intervals)")
         asyncio.create_task(periodic_refresh_task())
+        
+        # Start automatic cookie grabber (every 30 minutes)
+        debug_print("   3️⃣  Automatic cookie grabber task (30 min intervals)")
+        asyncio.create_task(periodic_auto_cookie_grabber())
+        
+        debug_print("="*60)
+        debug_print("✅ All background tasks started successfully!")
+        debug_print("="*60 + "\n")
+        
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
+        debug_print(traceback.format_exc())
         # Continue anyway - server should still start
 
 # --- UI Endpoints (Login/Dashboard) ---
