@@ -29,6 +29,12 @@ DEBUG = True
 # Port to run the server on
 PORT = 8000
 
+# Auto Cookie Grabber Configuration
+COOKIE_GRAB_INTERVAL = 1800  # 30 minutes in seconds
+COOKIE_GRAB_INITIAL_DELAY = 300  # 5 minutes initial delay in seconds
+CLOUDFLARE_TIMEOUT = 60000  # 60 seconds timeout for CF challenge
+CF_SCREENSHOT_PATH = "/tmp/cf_challenge_failed.png"  # Path for CF failure screenshots
+
 # HTTP Status Codes
 class HTTPStatus:
     # 1xx Informational
@@ -902,7 +908,7 @@ async def auto_grab_auth_cookies_with_login(google_email: str = None, google_pas
                         try:
                             await page.wait_for_function(
                                 "() => document.title.indexOf('Just a moment') === -1 && document.title.indexOf('Checking') === -1", 
-                                timeout=60000  # Increased to 60s for CF
+                                timeout=CLOUDFLARE_TIMEOUT
                             )
                             final_title = await page.title()
                             debug_print(f"   ✅ Cloudflare challenge passed! New title: '{final_title}'")
@@ -911,8 +917,8 @@ async def auto_grab_auth_cookies_with_login(google_email: str = None, google_pas
                             debug_print(f"   📸 Taking screenshot for debugging...")
                             
                             try:
-                                await page.screenshot(path="/tmp/cf_challenge_failed.png")
-                                debug_print(f"   📸 Screenshot saved: /tmp/cf_challenge_failed.png")
+                                await page.screenshot(path=CF_SCREENSHOT_PATH)
+                                debug_print(f"   📸 Screenshot saved: {CF_SCREENSHOT_PATH}")
                             except:
                                 pass
                             
@@ -1035,8 +1041,6 @@ async def auto_grab_auth_cookies_with_login(google_email: str = None, google_pas
         debug_print(f"   Error type: {type(e).__name__}")
         debug_print(f"   Error message: {str(e)}")
         
-        # Import traceback here for debugging
-        import traceback
         debug_print(f"\n📋 Full stack trace:")
         debug_print(traceback.format_exc())
         
@@ -1058,12 +1062,13 @@ async def periodic_auto_cookie_grabber():
     debug_print("\n" + "="*60)
     debug_print("🤖 AUTOMATIC COOKIE GRABBER - Starting Background Task")
     debug_print("="*60)
-    debug_print("   This task will run every 30 minutes automatically")
+    debug_print(f"   This task will run every {COOKIE_GRAB_INTERVAL // 60} minutes automatically")
     debug_print("   It will grab cookies whenever you're logged in to lmarena.ai")
     debug_print("="*60 + "\n")
     
-    # Wait 5 minutes before first run to let server stabilize
-    await asyncio.sleep(300)
+    # Wait before first run to let server stabilize
+    debug_print(f"⏳ Waiting {COOKIE_GRAB_INITIAL_DELAY // 60} minutes before first run...")
+    await asyncio.sleep(COOKIE_GRAB_INITIAL_DELAY)
     
     while True:
         try:
@@ -1079,27 +1084,27 @@ async def periodic_auto_cookie_grabber():
                 debug_print(f"ℹ️  Automatic grab info: {result['message']}")
             
             debug_print("="*60)
-            debug_print("⏰ Next automatic grab in 30 minutes")
+            debug_print(f"⏰ Next automatic grab in {COOKIE_GRAB_INTERVAL // 60} minutes")
             debug_print("="*60 + "\n")
             
-            # Wait 30 minutes before next attempt
-            await asyncio.sleep(1800)
+            # Wait before next attempt
+            await asyncio.sleep(COOKIE_GRAB_INTERVAL)
             
         except Exception as e:
             debug_print(f"❌ Error in periodic auto cookie grabber: {e}")
             debug_print(traceback.format_exc())
-            # Wait 30 minutes even on error
-            await asyncio.sleep(1800)
+            # Wait even on error
+            await asyncio.sleep(COOKIE_GRAB_INTERVAL)
             continue
 
 async def periodic_refresh_task():
     """Background task to refresh cf_clearance and models every 30 minutes"""
     while True:
         try:
-            # Wait 30 minutes (1800 seconds)
-            await asyncio.sleep(1800)
+            # Wait before refresh
+            await asyncio.sleep(COOKIE_GRAB_INTERVAL)
             debug_print("\n" + "="*60)
-            debug_print("🔄 Starting scheduled 30-minute refresh...")
+            debug_print(f"🔄 Starting scheduled {COOKIE_GRAB_INTERVAL // 60}-minute refresh...")
             debug_print("="*60)
             await get_initial_data()
             debug_print("✅ Scheduled refresh completed")
