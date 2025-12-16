@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import re
+import traceback
 import uuid
 import time
 import secrets
@@ -391,8 +393,41 @@ async def refresh_recaptcha_token():
 # Global state for auth token acquisition process
 AUTH_ACQUISITION_IN_PROGRESS = False
 BROWSER_PROFILE_DIR = "browser_profile"  # Persistent browser profile directory
+AUTH_TOKEN_ACQUISITION_TIMEOUT = 300  # 5 minutes timeout for interactive login
+# Track background tasks to prevent garbage collection and unhandled exceptions
+_background_tasks: set = set()
 
-import os
+
+def _create_background_task(coro):
+    """Create a background task and track it to prevent garbage collection."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _get_browser_profile_path() -> str:
+    """Get the absolute path to the browser profile directory."""
+    profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", BROWSER_PROFILE_DIR)
+    profile_path = os.path.abspath(profile_path)
+    os.makedirs(profile_path, exist_ok=True)
+    return profile_path
+
+
+async def _get_page_from_browser(browser) -> tuple:
+    """Helper to get page and context from browser (handles persistent context mode)."""
+    if browser.contexts:
+        context = browser.contexts[0]
+        pages = context.pages
+        if pages:
+            page = pages[0]
+        else:
+            page = await context.new_page()
+    else:
+        context = await browser.new_context()
+        page = await context.new_page()
+    return page, context
+
 
 async def acquire_auth_token_automatic() -> Optional[str]:
     """
@@ -420,10 +455,8 @@ async def acquire_auth_token_automatic() -> Optional[str]:
     AUTH_ACQUISITION_IN_PROGRESS = True
     debug_print("🤖 Starting AUTOMATIC auth token acquisition...")
     
-    # Ensure profile directory exists
-    profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", BROWSER_PROFILE_DIR)
-    profile_path = os.path.abspath(profile_path)
-    os.makedirs(profile_path, exist_ok=True)
+    # Get browser profile path
+    profile_path = _get_browser_profile_path()
     debug_print(f"  📁 Using browser profile: {profile_path}")
     
     try:
@@ -433,14 +466,8 @@ async def acquire_auth_token_automatic() -> Optional[str]:
             main_world_eval=True,
             persistent_context=profile_path,  # Persist login sessions
         ) as browser:
-            # Get existing context (persistent context mode)
-            pages = browser.contexts[0].pages if browser.contexts else []
-            if pages:
-                page = pages[0]
-            else:
-                page = await browser.contexts[0].new_page() if browser.contexts else await (await browser.new_context()).new_page()
-            
-            context = page.context
+            # Get page and context using helper function
+            page, context = await _get_page_from_browser(browser)
             
             debug_print("  🌐 Navigating to lmarena.ai...")
             await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
@@ -502,7 +529,6 @@ async def acquire_auth_token_automatic() -> Optional[str]:
                 
     except Exception as e:
         debug_print(f"❌ Error during automatic token acquisition: {e}")
-        import traceback
         debug_print(traceback.format_exc())
         return None
     finally:
@@ -532,10 +558,8 @@ async def acquire_auth_token_interactive(timeout_seconds: int = 300) -> Optional
     debug_print("🔐 Starting INTERACTIVE auth token acquisition (first-time setup)...")
     debug_print(f"⏱️  Timeout: {timeout_seconds} seconds")
     
-    # Ensure profile directory exists
-    profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", BROWSER_PROFILE_DIR)
-    profile_path = os.path.abspath(profile_path)
-    os.makedirs(profile_path, exist_ok=True)
+    # Get browser profile path
+    profile_path = _get_browser_profile_path()
     debug_print(f"  📁 Using browser profile: {profile_path}")
     
     try:
@@ -546,14 +570,8 @@ async def acquire_auth_token_interactive(timeout_seconds: int = 300) -> Optional
             main_world_eval=True,
             persistent_context=profile_path,  # Save login for future use
         ) as browser:
-            # Get page from persistent context
-            pages = browser.contexts[0].pages if browser.contexts else []
-            if pages:
-                page = pages[0]
-            else:
-                page = await browser.contexts[0].new_page() if browser.contexts else await (await browser.new_context()).new_page()
-            
-            context = page.context
+            # Get page and context using helper function
+            page, context = await _get_page_from_browser(browser)
             
             debug_print("  🌐 Navigating to lmarena.ai...")
             await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
@@ -642,7 +660,6 @@ async def acquire_auth_token_interactive(timeout_seconds: int = 300) -> Optional
                 
     except Exception as e:
         debug_print(f"❌ Error during interactive auth: {e}")
-        import traceback
         debug_print(traceback.format_exc())
         return None
     finally:
@@ -658,8 +675,9 @@ async def refresh_auth_tokens_automatic():
     debug_print("🔄 Attempting automatic auth token refresh...")
     
     # Check if we have a browser profile with saved login
-    profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", BROWSER_PROFILE_DIR)
-    if not os.path.exists(profile_path):
+    profile_path = _get_browser_profile_path()
+    # Check if profile directory exists and has content (indicating previous login)
+    if not os.path.exists(profile_path) or not os.listdir(profile_path):
         debug_print("  ⚠️ No browser profile found - need interactive login first")
         return None
     
@@ -1348,8 +1366,8 @@ async def startup_event():
             except Exception as e:
                 debug_print(f"⚠️ Auto auth failed (need interactive login first): {e}")
         
-        # 4. Start background tasks
-        asyncio.create_task(periodic_refresh_task())
+        # 4. Start background tasks with proper tracking
+        _create_background_task(periodic_refresh_task())
         
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
@@ -2288,8 +2306,9 @@ async def acquire_auth_token_endpoint(session: str = Depends(get_current_session
             </html>
         """)
     
-    # Start the acquisition in the background and show a waiting page
-    asyncio.create_task(acquire_auth_token_interactive(timeout_seconds=180))
+    # Start the acquisition in the background with proper task tracking
+    # Uses the constant AUTH_TOKEN_ACQUISITION_TIMEOUT for consistency
+    _create_background_task(acquire_auth_token_interactive(timeout_seconds=AUTH_TOKEN_ACQUISITION_TIMEOUT))
     
     return HTMLResponse("""
         <!DOCTYPE html>
@@ -2360,7 +2379,7 @@ async def acquire_auth_token_endpoint(session: str = Depends(get_current_session
                         <li>Click "Sign in with Google" on the LM Arena website</li>
                         <li>Complete the Google OAuth login</li>
                         <li>Once logged in, the token will be automatically captured</li>
-                        <li>You have 3 minutes to complete the login</li>
+                        <li>You have 5 minutes to complete the login</li>
                     </ol>
                 </div>
                 
