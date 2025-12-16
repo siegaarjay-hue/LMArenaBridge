@@ -387,6 +387,127 @@ async def refresh_recaptcha_token():
 
 # --- End New reCAPTCHA Functions ---
 
+# --- Automated Auth Token Acquisition ---
+# Global state for auth token acquisition process
+AUTH_ACQUISITION_STATUS: Dict[str, str] = {}  # session_id -> status message
+AUTH_ACQUISITION_IN_PROGRESS = False
+
+async def acquire_auth_token_interactive(timeout_seconds: int = 180) -> Optional[str]:
+    """
+    Opens a visible browser window for the user to login to LM Arena.
+    Monitors for the arena-auth-prod-v1 cookie and extracts it once available.
+    
+    Args:
+        timeout_seconds: How long to wait for user to login (default 3 minutes)
+    
+    Returns:
+        The auth token if successful, None otherwise
+    """
+    global AUTH_ACQUISITION_IN_PROGRESS
+    
+    if AUTH_ACQUISITION_IN_PROGRESS:
+        debug_print("⚠️ Auth token acquisition already in progress")
+        return None
+    
+    AUTH_ACQUISITION_IN_PROGRESS = True
+    debug_print("🔐 Starting interactive auth token acquisition...")
+    debug_print(f"⏱️  Timeout: {timeout_seconds} seconds")
+    
+    try:
+        # Open browser with headless=False so user can interact
+        async with AsyncCamoufox(headless=False, main_world_eval=True) as browser:
+            context = await browser.new_context()
+            page = await context.new_page()
+            
+            debug_print("  🌐 Navigating to lmarena.ai...")
+            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            
+            # Handle Cloudflare challenge if present
+            debug_print("  🛡️  Checking for Cloudflare challenge...")
+            try:
+                for _ in range(10):
+                    title = await page.title()
+                    if "Just a moment" in title:
+                        debug_print("  🔒 Cloudflare challenge active. Please complete it in the browser...")
+                        clicked = await click_turnstile(page)
+                        if clicked:
+                            debug_print("  ✅ Clicked Turnstile.")
+                            await asyncio.sleep(3)
+                    else:
+                        break
+                    await asyncio.sleep(1)
+            except Exception as e:
+                debug_print(f"  ⚠️ Error handling Turnstile: {e}")
+            
+            debug_print("  👤 Browser window opened. Please login via Google OAuth...")
+            debug_print("  ⏳ Waiting for arena-auth-prod-v1 cookie...")
+            
+            # Poll for the auth cookie
+            start_time = time.time()
+            auth_token = None
+            
+            while (time.time() - start_time) < timeout_seconds:
+                try:
+                    cookies = await context.cookies()
+                    
+                    # Look for arena-auth-prod-v1 cookie
+                    for cookie in cookies:
+                        if cookie["name"] == "arena-auth-prod-v1":
+                            auth_token = cookie["value"]
+                            debug_print(f"  ✅ Found auth token! Length: {len(auth_token)} chars")
+                            debug_print(f"  🔑 Token prefix: {auth_token[:30]}...")
+                            break
+                    
+                    if auth_token:
+                        break
+                    
+                    # Also check for cf_clearance while we're at it
+                    cf_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
+                    if cf_cookie:
+                        config = get_config()
+                        if config.get("cf_clearance") != cf_cookie["value"]:
+                            config["cf_clearance"] = cf_cookie["value"]
+                            save_config(config)
+                            debug_print(f"  ☁️ Updated cf_clearance cookie")
+                    
+                    elapsed = int(time.time() - start_time)
+                    if elapsed % 10 == 0 and elapsed > 0:
+                        remaining = timeout_seconds - elapsed
+                        debug_print(f"  ⏳ Waiting... ({remaining}s remaining)")
+                    
+                    await asyncio.sleep(2)
+                    
+                except Exception as e:
+                    debug_print(f"  ⚠️ Error checking cookies: {e}")
+                    await asyncio.sleep(2)
+            
+            if auth_token:
+                # Save the token to config
+                config = get_config()
+                auth_tokens = config.get("auth_tokens", [])
+                
+                if auth_token not in auth_tokens:
+                    auth_tokens.append(auth_token)
+                    config["auth_tokens"] = auth_tokens
+                    save_config(config)
+                    debug_print(f"✅ Auth token saved to config!")
+                else:
+                    debug_print(f"ℹ️ Auth token already exists in config")
+                
+                return auth_token
+            else:
+                debug_print(f"❌ Timeout waiting for auth token after {timeout_seconds}s")
+                return None
+                
+    except Exception as e:
+        debug_print(f"❌ Error during auth token acquisition: {e}")
+        return None
+    finally:
+        AUTH_ACQUISITION_IN_PROGRESS = False
+        debug_print("🔐 Auth token acquisition process ended")
+
+# --- End Automated Auth Token Acquisition ---
+
 # Custom UUIDv7 implementation (using correct Unix epoch)
 def uuid7():
     """
@@ -1594,7 +1715,24 @@ async def dashboard(session: str = Depends(get_current_session)):
                     
                     {('<div class="no-data">No tokens configured. Add tokens below.</div>' if not config.get("auth_tokens") else '')}
                     
-                    <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">Add New Token</h3>
+                    <!-- Automated Token Acquisition -->
+                    <div style="background: linear-gradient(135deg, #667eea22 0%, #764ba222 100%); padding: 20px; border-radius: 8px; margin-top: 25px; border: 1px solid #667eea44;">
+                        <h3 style="margin-bottom: 10px; font-size: 16px; color: #667eea;">🤖 Automated Token Acquisition</h3>
+                        <p style="color: #666; margin-bottom: 15px; font-size: 14px;">
+                            Click the button below to open a browser window on the server. Login via Google OAuth and the token will be automatically captured.
+                            <br><em>Note: This requires access to the server's display (works best with local installations).</em>
+                        </p>
+                        <form action="/acquire-auth-token" method="post">
+                            <button type="submit" style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);">
+                                🔓 Launch Browser &amp; Acquire Token
+                            </button>
+                        </form>
+                    </div>
+                    
+                    <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">📋 Manual Token Entry</h3>
+                    <p style="color: #666; margin-bottom: 15px; font-size: 14px;">
+                        Or manually paste a token if you prefer to extract it yourself from your browser.
+                    </p>
                     <form action="/add-auth-token" method="post">
                         <div class="form-group">
                             <label for="new_auth_token">New Arena Auth Token</label>
@@ -1891,6 +2029,149 @@ async def refresh_tokens(session: str = Depends(get_current_session)):
     except Exception as e:
         debug_print(f"❌ Error refreshing tokens: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/acquire-auth-token")
+async def acquire_auth_token_endpoint(session: str = Depends(get_current_session)):
+    """
+    Endpoint to trigger automated auth token acquisition.
+    Opens a browser window for the user to login via Google OAuth.
+    """
+    if not session:
+        return RedirectResponse(url="/login")
+    
+    if AUTH_ACQUISITION_IN_PROGRESS:
+        # Already in progress, just redirect back
+        return HTMLResponse("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Auth Token Acquisition - LMArena Bridge</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        min-height: 100vh;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        margin: 0;
+                    }
+                    .container {
+                        background: white;
+                        padding: 40px;
+                        border-radius: 10px;
+                        box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                        max-width: 500px;
+                        text-align: center;
+                    }
+                    h1 { color: #333; margin-bottom: 20px; }
+                    p { color: #666; line-height: 1.6; }
+                    .warning { color: #e74c3c; }
+                    a { color: #667eea; text-decoration: none; }
+                    a:hover { text-decoration: underline; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>⚠️ Already In Progress</h1>
+                    <p class="warning">Auth token acquisition is already running in another session.</p>
+                    <p>Please complete the login in the browser window that opened, or wait for it to timeout.</p>
+                    <p><a href="/dashboard">← Back to Dashboard</a></p>
+                </div>
+            </body>
+            </html>
+        """)
+    
+    # Start the acquisition in the background and show a waiting page
+    asyncio.create_task(acquire_auth_token_interactive(timeout_seconds=180))
+    
+    return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Auth Token Acquisition - LMArena Bridge</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta http-equiv="refresh" content="5;url=/dashboard">
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin: 0;
+                }
+                .container {
+                    background: white;
+                    padding: 40px;
+                    border-radius: 10px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 600px;
+                    text-align: center;
+                }
+                h1 { color: #333; margin-bottom: 20px; }
+                p { color: #666; line-height: 1.6; margin-bottom: 15px; }
+                .success { color: #27ae60; }
+                .spinner {
+                    border: 4px solid #f3f3f3;
+                    border-top: 4px solid #667eea;
+                    border-radius: 50%;
+                    width: 40px;
+                    height: 40px;
+                    animation: spin 1s linear infinite;
+                    margin: 20px auto;
+                }
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+                .steps {
+                    text-align: left;
+                    background: #f8f9fa;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin: 20px 0;
+                }
+                .steps li {
+                    margin-bottom: 10px;
+                    color: #555;
+                }
+                a { color: #667eea; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🔐 Auth Token Acquisition Started</h1>
+                <div class="spinner"></div>
+                <p class="success">A browser window should have opened on the server.</p>
+                
+                <div class="steps">
+                    <strong>Instructions:</strong>
+                    <ol>
+                        <li>Look for the browser window that opened on the server</li>
+                        <li>Click "Sign in with Google" on the LM Arena website</li>
+                        <li>Complete the Google OAuth login</li>
+                        <li>Once logged in, the token will be automatically captured</li>
+                        <li>You have 3 minutes to complete the login</li>
+                    </ol>
+                </div>
+                
+                <p>This page will redirect to the dashboard in 5 seconds...</p>
+                <p><a href="/dashboard">← Back to Dashboard</a></p>
+            </div>
+        </body>
+        </html>
+    """)
+
+@app.get("/acquire-auth-token-status")
+async def acquire_auth_token_status(session: str = Depends(get_current_session)):
+    """Check the status of auth token acquisition"""
+    if not session:
+        return {"error": "Not authenticated"}
+    return {"in_progress": AUTH_ACQUISITION_IN_PROGRESS}
 
 # --- OpenAI Compatible API Endpoints ---
 

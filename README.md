@@ -36,7 +36,22 @@ A bridge to interact with LM Arena. This project provides an OpenAI compatible A
 
 ### 1. Get your Authentication Token
 
-To use the LM Arena Bridge, you need to get your authentication token from the LM Arena website.
+There are two ways to get your authentication token:
+
+#### Option A: Automated Acquisition (Recommended)
+
+1.  Start the application: `python src/main.py`
+2.  Go to the admin portal at `http://localhost:8000/dashboard`
+3.  Login with your admin password
+4.  In the "Arena Authentication Tokens" section, click **"🔓 Launch Browser & Acquire Token"**
+5.  A browser window will open on the server - login with your Google account
+6.  The token will be automatically captured and saved
+
+> **Note:** Automated acquisition requires access to the server's display. It works best with local installations or when you have graphical access to the server.
+
+#### Option B: Manual Extraction
+
+If automated acquisition doesn't work for your setup:
 
 1.  Open your web browser and go to the LM Arena website.
 2.  Send a message in the chat to any model.
@@ -49,7 +64,7 @@ To use the LM Arena Bridge, you need to get your authentication token from the L
 
 1.  Go to the admin portal.
 2.  Login.
-3.  Add the token to the list.
+3.  Add the token to the list (if using manual extraction).
 
 ### 3. Run the Application
 
