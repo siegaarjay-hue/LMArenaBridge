@@ -36,7 +36,28 @@ A bridge to interact with LM Arena. This project provides an OpenAI compatible A
 
 ### 1. Get your Authentication Token
 
-To use the LM Arena Bridge, you need to get your authentication token from the LM Arena website.
+**No manual cookie extraction required!** LMArenaBridge includes fully automated token management.
+
+#### Automatic Token Acquisition (Recommended)
+
+1.  Start the application: `python src/main.py`
+2.  Go to the admin portal at `http://localhost:8000/dashboard`
+3.  Login with your admin password (default: `admin`)
+4.  In the "Automatic Token Management" section:
+    - **First-time setup:** Click **"🔓 Launch Browser Login"** 
+    - A browser window opens → Login with Google OAuth
+    - Your login session is **saved permanently** for future automatic refreshes
+
+5.  **After first login, tokens refresh automatically!**
+    - The system refreshes tokens every 30 minutes automatically
+    - Click "🔄 Auto-Refresh Now" to manually trigger an immediate refresh
+    - No further manual intervention is needed
+
+> **How it works:** The browser session is persisted in a `browser_profile` directory. After the initial Google login, the saved session allows fully headless (automated) token refresh without any user interaction.
+
+#### Manual Extraction (Fallback)
+
+Only use this if automated acquisition doesn't work for your setup:
 
 1.  Open your web browser and go to the LM Arena website.
 2.  Send a message in the chat to any model.
@@ -45,15 +66,9 @@ To use the LM Arena Bridge, you need to get your authentication token from the L
 5.  In the "Cookies" section, find the cookies for the LM Arena site.
 6.  Look for a cookie named `arena-auth-prod-v1` and copy its value. This is your authentication token. THIS IS THE TOKEN STARTING WITH base64-
 
-### 2. Configure the Application
+### 2. Run the Application
 
-1.  Go to the admin portal.
-2.  Login.
-3.  Add the token to the list.
-
-### 3. Run the Application
-
-Once you have configured your authentication token, you can run the application:
+Once configured, run the application:
 
 ```bash
 python src/main.py

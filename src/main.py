@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import re
+import traceback
 import uuid
 import time
 import secrets
@@ -386,6 +388,302 @@ async def refresh_recaptcha_token():
     return RECAPTCHA_TOKEN
 
 # --- End New reCAPTCHA Functions ---
+
+# --- Automated Auth Token Acquisition ---
+# Global state for auth token acquisition process
+AUTH_ACQUISITION_IN_PROGRESS = False
+BROWSER_PROFILE_DIR = "browser_profile"  # Persistent browser profile directory
+AUTH_TOKEN_ACQUISITION_TIMEOUT = 300  # 5 minutes timeout for interactive login
+# Track background tasks to prevent garbage collection and unhandled exceptions
+_background_tasks: set = set()
+
+
+def _create_background_task(coro):
+    """Create a background task and track it to prevent garbage collection."""
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+def _get_browser_profile_path() -> str:
+    """Get the absolute path to the browser profile directory."""
+    profile_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", BROWSER_PROFILE_DIR)
+    profile_path = os.path.abspath(profile_path)
+    os.makedirs(profile_path, exist_ok=True)
+    return profile_path
+
+
+async def _get_page_from_browser(browser) -> tuple:
+    """Helper to get page and context from browser (handles persistent context mode)."""
+    if browser.contexts:
+        context = browser.contexts[0]
+        pages = context.pages
+        if pages:
+            page = pages[0]
+        else:
+            page = await context.new_page()
+    else:
+        context = await browser.new_context()
+        page = await context.new_page()
+    return page, context
+
+
+async def acquire_auth_token_automatic() -> Optional[str]:
+    """
+    Fully automated auth token acquisition using a persistent browser profile.
+    
+    How it works:
+    1. Uses a persistent browser profile that saves login state
+    2. If the user was previously logged in, the session persists
+    3. Navigates to LM Arena and extracts the auth cookie automatically
+    4. No manual intervention needed after first login
+    
+    First-time setup:
+    - Call acquire_auth_token_interactive() once to login
+    - After that, this function can refresh tokens automatically
+    
+    Returns:
+        The auth token if successful, None otherwise
+    """
+    global AUTH_ACQUISITION_IN_PROGRESS
+    
+    if AUTH_ACQUISITION_IN_PROGRESS:
+        debug_print("⚠️ Auth token acquisition already in progress")
+        return None
+    
+    AUTH_ACQUISITION_IN_PROGRESS = True
+    debug_print("🤖 Starting AUTOMATIC auth token acquisition...")
+    
+    # Get browser profile path
+    profile_path = _get_browser_profile_path()
+    debug_print(f"  📁 Using browser profile: {profile_path}")
+    
+    try:
+        # Use persistent context with camoufox for anti-detection
+        async with AsyncCamoufox(
+            headless=True,  # Fully headless - no user interaction
+            main_world_eval=True,
+            persistent_context=profile_path,  # Persist login sessions
+        ) as browser:
+            # Get page and context using helper function
+            page, context = await _get_page_from_browser(browser)
+            
+            debug_print("  🌐 Navigating to lmarena.ai...")
+            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            
+            # Handle Cloudflare challenge automatically
+            debug_print("  🛡️  Handling Cloudflare challenge...")
+            for attempt in range(15):
+                title = await page.title()
+                if "Just a moment" not in title:
+                    debug_print("  ✅ Cloudflare challenge passed!")
+                    break
+                
+                # Try clicking Turnstile
+                clicked = await click_turnstile(page)
+                if clicked:
+                    debug_print(f"  🖱️ Clicked Turnstile (attempt {attempt + 1})")
+                await asyncio.sleep(2)
+            
+            # Wait for page to fully load
+            await asyncio.sleep(3)
+            
+            # Check for auth cookie
+            cookies = await context.cookies()
+            auth_token = None
+            cf_clearance = None
+            
+            for cookie in cookies:
+                if cookie["name"] == "arena-auth-prod-v1":
+                    auth_token = cookie["value"]
+                    debug_print(f"  ✅ Found auth token! Length: {len(auth_token)} chars")
+                elif cookie["name"] == "cf_clearance":
+                    cf_clearance = cookie["value"]
+            
+            # Save cf_clearance if found
+            if cf_clearance:
+                config = get_config()
+                config["cf_clearance"] = cf_clearance
+                save_config(config)
+                debug_print(f"  ☁️ Updated cf_clearance")
+            
+            if auth_token:
+                # Save the token
+                config = get_config()
+                auth_tokens = config.get("auth_tokens", [])
+                
+                if auth_token not in auth_tokens:
+                    auth_tokens.append(auth_token)
+                    config["auth_tokens"] = auth_tokens
+                    save_config(config)
+                    debug_print(f"✅ New auth token saved!")
+                else:
+                    debug_print(f"✅ Auth token verified (already in config)")
+                
+                return auth_token
+            else:
+                debug_print("❌ No auth token found - user needs to login first")
+                debug_print("   Run 'acquire_auth_token_interactive()' to login")
+                return None
+                
+    except Exception as e:
+        debug_print(f"❌ Error during automatic token acquisition: {e}")
+        debug_print(traceback.format_exc())
+        return None
+    finally:
+        AUTH_ACQUISITION_IN_PROGRESS = False
+
+
+async def acquire_auth_token_interactive(timeout_seconds: int = 300) -> Optional[str]:
+    """
+    Opens a visible browser window for first-time login setup.
+    Uses persistent browser profile so login is saved for future automatic use.
+    
+    After first login, use acquire_auth_token_automatic() for headless token refresh.
+    
+    Args:
+        timeout_seconds: How long to wait for user to login (default 5 minutes)
+    
+    Returns:
+        The auth token if successful, None otherwise
+    """
+    global AUTH_ACQUISITION_IN_PROGRESS
+    
+    if AUTH_ACQUISITION_IN_PROGRESS:
+        debug_print("⚠️ Auth token acquisition already in progress")
+        return None
+    
+    AUTH_ACQUISITION_IN_PROGRESS = True
+    debug_print("🔐 Starting INTERACTIVE auth token acquisition (first-time setup)...")
+    debug_print(f"⏱️  Timeout: {timeout_seconds} seconds")
+    
+    # Get browser profile path
+    profile_path = _get_browser_profile_path()
+    debug_print(f"  📁 Using browser profile: {profile_path}")
+    
+    try:
+        # Open browser with headless=False so user can login
+        # Use persistent context to save the login session
+        async with AsyncCamoufox(
+            headless=False,  # Visible browser for user interaction
+            main_world_eval=True,
+            persistent_context=profile_path,  # Save login for future use
+        ) as browser:
+            # Get page and context using helper function
+            page, context = await _get_page_from_browser(browser)
+            
+            debug_print("  🌐 Navigating to lmarena.ai...")
+            await page.goto("https://lmarena.ai/", wait_until="domcontentloaded")
+            
+            # Handle Cloudflare challenge
+            debug_print("  🛡️  Checking for Cloudflare challenge...")
+            for _ in range(10):
+                title = await page.title()
+                if "Just a moment" not in title:
+                    break
+                clicked = await click_turnstile(page)
+                if clicked:
+                    debug_print("  ✅ Clicked Turnstile")
+                await asyncio.sleep(2)
+            
+            debug_print("")
+            debug_print("  ╔════════════════════════════════════════════════════════╗")
+            debug_print("  ║  👤 BROWSER WINDOW OPENED                              ║")
+            debug_print("  ║                                                        ║")
+            debug_print("  ║  Please login via Google OAuth in the browser window.  ║")
+            debug_print("  ║  Your login will be SAVED for automatic future use.    ║")
+            debug_print("  ║                                                        ║")
+            debug_print("  ║  After logging in, the token will be captured          ║")
+            debug_print("  ║  automatically and this window will close.             ║")
+            debug_print("  ╚════════════════════════════════════════════════════════╝")
+            debug_print("")
+            
+            # Poll for the auth cookie
+            start_time = time.time()
+            auth_token = None
+            last_log_time = 0
+            
+            while (time.time() - start_time) < timeout_seconds:
+                try:
+                    cookies = await context.cookies()
+                    
+                    # Look for arena-auth-prod-v1 cookie
+                    for cookie in cookies:
+                        if cookie["name"] == "arena-auth-prod-v1":
+                            auth_token = cookie["value"]
+                            break
+                    
+                    if auth_token:
+                        debug_print(f"  ✅ AUTH TOKEN CAPTURED! Length: {len(auth_token)} chars")
+                        break
+                    
+                    # Also save cf_clearance
+                    cf_cookie = next((c for c in cookies if c["name"] == "cf_clearance"), None)
+                    if cf_cookie:
+                        config = get_config()
+                        if config.get("cf_clearance") != cf_cookie["value"]:
+                            config["cf_clearance"] = cf_cookie["value"]
+                            save_config(config)
+                    
+                    # Log progress every 15 seconds
+                    elapsed = int(time.time() - start_time)
+                    if elapsed - last_log_time >= 15:
+                        remaining = timeout_seconds - elapsed
+                        debug_print(f"  ⏳ Waiting for login... ({remaining}s remaining)")
+                        last_log_time = elapsed
+                    
+                    await asyncio.sleep(1)
+                    
+                except Exception as e:
+                    debug_print(f"  ⚠️ Error checking cookies: {e}")
+                    await asyncio.sleep(2)
+            
+            if auth_token:
+                # Save the token
+                config = get_config()
+                auth_tokens = config.get("auth_tokens", [])
+                
+                if auth_token not in auth_tokens:
+                    auth_tokens.append(auth_token)
+                    config["auth_tokens"] = auth_tokens
+                    save_config(config)
+                    debug_print(f"✅ Auth token saved to config!")
+                    debug_print(f"✅ Login session saved - future token refresh will be AUTOMATIC!")
+                else:
+                    debug_print(f"ℹ️ Auth token already exists in config")
+                
+                return auth_token
+            else:
+                debug_print(f"❌ Timeout waiting for login after {timeout_seconds}s")
+                return None
+                
+    except Exception as e:
+        debug_print(f"❌ Error during interactive auth: {e}")
+        debug_print(traceback.format_exc())
+        return None
+    finally:
+        AUTH_ACQUISITION_IN_PROGRESS = False
+        debug_print("🔐 Auth token acquisition process ended")
+
+
+async def refresh_auth_tokens_automatic():
+    """
+    Background task to automatically refresh auth tokens using saved browser session.
+    Called periodically to ensure tokens stay fresh.
+    """
+    debug_print("🔄 Attempting automatic auth token refresh...")
+    
+    # Check if we have a browser profile with saved login
+    profile_path = _get_browser_profile_path()
+    # Check if profile directory exists and has content (indicating previous login)
+    if not os.path.exists(profile_path) or not os.listdir(profile_path):
+        debug_print("  ⚠️ No browser profile found - need interactive login first")
+        return None
+    
+    return await acquire_auth_token_automatic()
+
+# --- End Automated Auth Token Acquisition ---
 
 # Custom UUIDv7 implementation (using correct Unix epoch)
 def uuid7():
@@ -1017,7 +1315,7 @@ async def get_initial_data():
         debug_print(f"❌ An error occurred during initial data retrieval: {e}")
 
 async def periodic_refresh_task():
-    """Background task to refresh cf_clearance and models every 30 minutes"""
+    """Background task to refresh cf_clearance, models, and auth tokens every 30 minutes"""
     while True:
         try:
             # Wait 30 minutes (1800 seconds)
@@ -1025,7 +1323,16 @@ async def periodic_refresh_task():
             debug_print("\n" + "="*60)
             debug_print("🔄 Starting scheduled 30-minute refresh...")
             debug_print("="*60)
+            
+            # Refresh cf_clearance and models
             await get_initial_data()
+            
+            # Try to auto-refresh auth token if browser profile exists
+            try:
+                await refresh_auth_tokens_automatic()
+            except Exception as e:
+                debug_print(f"⚠️ Auto auth refresh skipped: {e}")
+            
             debug_print("✅ Scheduled refresh completed")
             debug_print("="*60 + "\n")
         except Exception as e:
@@ -1050,8 +1357,17 @@ async def startup_event():
         # Block startup until we have a token or fail, so we don't serve 403s
         await refresh_recaptcha_token()
         
-        # 3. Start background tasks
-        asyncio.create_task(periodic_refresh_task())
+        # 3. Try automatic auth token refresh (works if browser profile has saved login)
+        config = get_config()
+        if not config.get("auth_tokens"):
+            debug_print("ℹ️ No auth tokens configured - attempting automatic acquisition...")
+            try:
+                await refresh_auth_tokens_automatic()
+            except Exception as e:
+                debug_print(f"⚠️ Auto auth failed (need interactive login first): {e}")
+        
+        # 4. Start background tasks with proper tracking
+        _create_background_task(periodic_refresh_task())
         
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")
@@ -1579,8 +1895,45 @@ async def dashboard(session: str = Depends(get_current_session)):
                         <span class="status-badge {token_class}">{token_status}</span>
                     </div>
                     
-                    <h3 style="margin-bottom: 15px; font-size: 16px;">Multiple Auth Tokens (Round-Robin)</h3>
-                    <p style="color: #666; margin-bottom: 15px;">Add multiple tokens for automatic cycling. Each conversation will use a consistent token.</p>
+                    <!-- Automated Token Acquisition - FIRST and PRIMARY -->
+                    <div style="background: linear-gradient(135deg, #27ae6022 0%, #2ecc7122 100%); padding: 25px; border-radius: 10px; margin-bottom: 25px; border: 2px solid #27ae6044;">
+                        <h3 style="margin-bottom: 15px; font-size: 18px; color: #27ae60;">🤖 Automatic Token Management</h3>
+                        <p style="color: #555; margin-bottom: 20px; font-size: 14px;">
+                            <strong>No manual cookie extraction needed!</strong> The system automatically handles authentication tokens.
+                        </p>
+                        
+                        <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-bottom: 15px;">
+                            <!-- First-Time Setup Button -->
+                            <div style="background: white; padding: 15px; border-radius: 8px; border: 1px solid #ddd;">
+                                <h4 style="font-size: 14px; margin-bottom: 10px; color: #333;">🔓 First-Time Setup</h4>
+                                <p style="font-size: 12px; color: #666; margin-bottom: 10px;">Opens a browser for one-time Google login. Session is saved for future use.</p>
+                                <form action="/acquire-auth-token" method="post" style="margin: 0;">
+                                    <button type="submit" style="width: 100%; background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); font-size: 13px; padding: 10px;">
+                                        🔓 Launch Browser Login
+                                    </button>
+                                </form>
+                            </div>
+                            
+                            <!-- Auto-Refresh Button -->
+                            <div style="background: white; padding: 15px; border-radius: 8px; border: 1px solid #ddd;">
+                                <h4 style="font-size: 14px; margin-bottom: 10px; color: #333;">🔄 Auto-Refresh Token</h4>
+                                <p style="font-size: 12px; color: #666; margin-bottom: 10px;">Uses saved session to refresh token automatically. No interaction needed.</p>
+                                <form action="/auto-refresh-auth-token" method="post" style="margin: 0;">
+                                    <button type="submit" style="width: 100%; background: #27ae60; font-size: 13px; padding: 10px;">
+                                        🔄 Auto-Refresh Now
+                                    </button>
+                                </form>
+                            </div>
+                        </div>
+                        
+                        <p style="font-size: 12px; color: #888; margin: 0;">
+                            <em>💡 Tip: After first-time setup, tokens refresh automatically every 30 minutes. Use "Auto-Refresh" for immediate refresh.</em>
+                        </p>
+                    </div>
+                    
+                    <!-- Current Tokens -->
+                    <h3 style="margin-bottom: 15px; font-size: 16px;">📋 Current Auth Tokens ({len(config.get("auth_tokens", []))})</h3>
+                    <p style="color: #666; margin-bottom: 15px;">Tokens are cycled automatically using round-robin selection.</p>
                     
                     {''.join([f'''
                     <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 10px; padding: 10px; background: #f8f9fa; border-radius: 6px;">
@@ -1592,16 +1945,24 @@ async def dashboard(session: str = Depends(get_current_session)):
                     </div>
                     ''' for i, token in enumerate(config.get("auth_tokens", []))])}
                     
-                    {('<div class="no-data">No tokens configured. Add tokens below.</div>' if not config.get("auth_tokens") else '')}
+                    {('<div class="no-data">No tokens yet. Use "Launch Browser Login" above to set up automatic token acquisition.</div>' if not config.get("auth_tokens") else '')}
                     
-                    <h3 style="margin-top: 25px; margin-bottom: 15px; font-size: 16px;">Add New Token</h3>
-                    <form action="/add-auth-token" method="post">
-                        <div class="form-group">
-                            <label for="new_auth_token">New Arena Auth Token</label>
-                            <textarea id="new_auth_token" name="new_auth_token" placeholder="Paste a new arena-auth-prod-v1 token here" required></textarea>
+                    <!-- Manual Token Entry (collapsed/secondary) -->
+                    <details style="margin-top: 20px;">
+                        <summary style="cursor: pointer; color: #666; font-size: 14px;">📝 Manual Token Entry (Advanced)</summary>
+                        <div style="padding-top: 15px;">
+                            <p style="color: #888; margin-bottom: 15px; font-size: 13px;">
+                                Only use this if automatic acquisition doesn't work for your setup.
+                            </p>
+                            <form action="/add-auth-token" method="post">
+                                <div class="form-group">
+                                    <label for="new_auth_token">Arena Auth Token (arena-auth-prod-v1)</label>
+                                    <textarea id="new_auth_token" name="new_auth_token" placeholder="Paste token here..." required style="font-size: 12px;"></textarea>
+                                </div>
+                                <button type="submit" style="background: #6c757d;">Add Token Manually</button>
+                            </form>
                         </div>
-                        <button type="submit">Add Token</button>
-                    </form>
+                    </details>
                 </div>
 
                 <!-- Cloudflare Clearance -->
@@ -1891,6 +2252,191 @@ async def refresh_tokens(session: str = Depends(get_current_session)):
     except Exception as e:
         debug_print(f"❌ Error refreshing tokens: {e}")
     return RedirectResponse(url="/dashboard", status_code=status.HTTP_303_SEE_OTHER)
+
+@app.post("/acquire-auth-token")
+async def acquire_auth_token_endpoint(session: str = Depends(get_current_session)):
+    """
+    Endpoint to trigger automated auth token acquisition.
+    Opens a browser window for the user to login via Google OAuth.
+    """
+    if not session:
+        return RedirectResponse(url="/login")
+    
+    if AUTH_ACQUISITION_IN_PROGRESS:
+        # Already in progress, just redirect back
+        return HTMLResponse("""
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Auth Token Acquisition - LMArena Bridge</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1.0">
+                <style>
+                    body {
+                        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                        min-height: 100vh;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        margin: 0;
+                    }
+                    .container {
+                        background: white;
+                        padding: 40px;
+                        border-radius: 10px;
+                        box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                        max-width: 500px;
+                        text-align: center;
+                    }
+                    h1 { color: #333; margin-bottom: 20px; }
+                    p { color: #666; line-height: 1.6; }
+                    .warning { color: #e74c3c; }
+                    a { color: #667eea; text-decoration: none; }
+                    a:hover { text-decoration: underline; }
+                </style>
+            </head>
+            <body>
+                <div class="container">
+                    <h1>⚠️ Already In Progress</h1>
+                    <p class="warning">Auth token acquisition is already running in another session.</p>
+                    <p>Please complete the login in the browser window that opened, or wait for it to timeout.</p>
+                    <p><a href="/dashboard">← Back to Dashboard</a></p>
+                </div>
+            </body>
+            </html>
+        """)
+    
+    # Start the acquisition in the background with proper task tracking
+    # Uses the constant AUTH_TOKEN_ACQUISITION_TIMEOUT for consistency
+    _create_background_task(acquire_auth_token_interactive(timeout_seconds=AUTH_TOKEN_ACQUISITION_TIMEOUT))
+    
+    return HTMLResponse("""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>Auth Token Acquisition - LMArena Bridge</title>
+            <meta name="viewport" content="width=device-width, initial-scale=1.0">
+            <meta http-equiv="refresh" content="5;url=/dashboard">
+            <style>
+                body {
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    min-height: 100vh;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    margin: 0;
+                }
+                .container {
+                    background: white;
+                    padding: 40px;
+                    border-radius: 10px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+                    max-width: 600px;
+                    text-align: center;
+                }
+                h1 { color: #333; margin-bottom: 20px; }
+                p { color: #666; line-height: 1.6; margin-bottom: 15px; }
+                .success { color: #27ae60; }
+                .spinner {
+                    border: 4px solid #f3f3f3;
+                    border-top: 4px solid #667eea;
+                    border-radius: 50%;
+                    width: 40px;
+                    height: 40px;
+                    animation: spin 1s linear infinite;
+                    margin: 20px auto;
+                }
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+                .steps {
+                    text-align: left;
+                    background: #f8f9fa;
+                    padding: 20px;
+                    border-radius: 8px;
+                    margin: 20px 0;
+                }
+                .steps li {
+                    margin-bottom: 10px;
+                    color: #555;
+                }
+                a { color: #667eea; text-decoration: none; }
+                a:hover { text-decoration: underline; }
+            </style>
+        </head>
+        <body>
+            <div class="container">
+                <h1>🔐 Auth Token Acquisition Started</h1>
+                <div class="spinner"></div>
+                <p class="success">A browser window should have opened on the server.</p>
+                
+                <div class="steps">
+                    <strong>Instructions:</strong>
+                    <ol>
+                        <li>Look for the browser window that opened on the server</li>
+                        <li>Click "Sign in with Google" on the LM Arena website</li>
+                        <li>Complete the Google OAuth login</li>
+                        <li>Once logged in, the token will be automatically captured</li>
+                        <li>You have 5 minutes to complete the login</li>
+                    </ol>
+                </div>
+                
+                <p>This page will redirect to the dashboard in 5 seconds...</p>
+                <p><a href="/dashboard">← Back to Dashboard</a></p>
+            </div>
+        </body>
+        </html>
+    """)
+
+@app.get("/acquire-auth-token-status")
+async def acquire_auth_token_status(session: str = Depends(get_current_session)):
+    """Check the status of auth token acquisition"""
+    if not session:
+        return {"error": "Not authenticated"}
+    return {"in_progress": AUTH_ACQUISITION_IN_PROGRESS}
+
+@app.post("/auto-refresh-auth-token")
+async def auto_refresh_auth_token_endpoint(session: str = Depends(get_current_session)):
+    """
+    Automatically refresh auth token using saved browser session.
+    Works after first interactive login - fully automatic, no user interaction needed.
+    """
+    if not session:
+        return RedirectResponse(url="/login")
+    
+    if AUTH_ACQUISITION_IN_PROGRESS:
+        return HTMLResponse("""
+            <html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
+                <h1>⚠️ Already In Progress</h1>
+                <p>Token acquisition is already running.</p>
+                <p><a href="/dashboard">← Back to Dashboard</a></p>
+            </body></html>
+        """)
+    
+    # Try automatic acquisition
+    result = await acquire_auth_token_automatic()
+    
+    if result:
+        return HTMLResponse(f"""
+            <html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
+                <h1>✅ Token Refreshed!</h1>
+                <p>Auth token was automatically refreshed using your saved session.</p>
+                <p>Token length: {len(result)} characters</p>
+                <p><a href="/dashboard">← Back to Dashboard</a></p>
+                <script>setTimeout(() => window.location.href = '/dashboard', 3000);</script>
+            </body></html>
+        """)
+    else:
+        return HTMLResponse("""
+            <html><body style="font-family: sans-serif; padding: 40px; text-align: center;">
+                <h1>❌ Auto-Refresh Failed</h1>
+                <p>Could not automatically refresh the token.</p>
+                <p>This usually means you need to do the first-time interactive login.</p>
+                <p><a href="/dashboard">← Back to Dashboard</a></p>
+            </body></html>
+        """)
 
 # --- OpenAI Compatible API Endpoints ---
 
